@@ -64,6 +64,7 @@ private fun DiagnosticsScreen() {
             .padding(16.dp)
     ) {
         Text("AuralCam: camera diagnostics", color = Color.White)
+Text("Native: ${com.keiranhaas.auralcam.NativeBridge.nativeVersion()}", color = Color.White)
         Text("Camera permission: ${if (granted) "granted" else "not granted"}", color = Color.White)
         Text("Back lenses found: ${lenses.size}", color = Color.White)
         lenses.forEach { c ->
