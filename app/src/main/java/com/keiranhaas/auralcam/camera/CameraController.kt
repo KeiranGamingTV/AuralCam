@@ -70,6 +70,8 @@ class CameraController(
     private var rawReader: ImageReader? = null
 
     private var sessionGen = 0
+    /** False once the lens refused to run the analysis stream next to the capture outputs. */
+    private var useAnalysis = true
     private var framesSinceChange = 0
     private var lastLiveMs = 0L
     private var jobCounter = 0L
@@ -151,7 +153,12 @@ class CameraController(
         _state.update { it.copy(settings = new, exposureAtLimit = false) }
 
         val planChanged = old.needsJpeg() != new.needsJpeg() || old.needsRaw() != new.needsRaw()
-        if (planChanged) createSessionLocked() else applyRepeatingLocked()
+        if (planChanged) {
+            useAnalysis = true   // a changed output plan restarts the fallback chain
+            createSessionLocked()
+        } else {
+            applyRepeatingLocked()
+        }
     }
 
     fun tapToFocus(point: NormPoint) = post {
@@ -293,6 +300,7 @@ class CameraController(
         factory = RequestFactory(ch, caps)
         priority = PriorityExposureController(caps.isoMin, caps.isoMax, caps.exposureMinNs, caps.exposureMaxNs)
         outputs = plan
+        useAnalysis = true
         _state.update {
             it.copy(
                 active = caps,
@@ -351,15 +359,20 @@ class CameraController(
         texture.setDefaultBufferSize(out.preview.width, out.preview.height)
         val surface = Surface(texture)
         previewSurface = surface
+        val configs = mutableListOf(OutputConfiguration(surface))
 
-        val analysis = ImageReader.newInstance(out.analysis.width, out.analysis.height, ImageFormat.YUV_420_888, 3)
-        analysis.setOnImageAvailableListener({ r ->
-            val img = try { r.acquireLatestImage() } catch (e: IllegalStateException) { null }
-            if (img != null) {
-                try { analysisSink?.onFrame(img) } finally { img.close() }
-            }
-        }, analysisHandler)
-        analysisReader = analysis
+        if (useAnalysis) {
+            val analysis = ImageReader.newInstance(out.analysis.width, out.analysis.height, ImageFormat.YUV_420_888, 3)
+            analysis.setOnImageAvailableListener({ r ->
+                val img = try { r.acquireLatestImage() } catch (e: IllegalStateException) { null }
+                if (img != null) {
+                    try { analysisSink?.onFrame(img) } finally { img.close() }
+                }
+            }, analysisHandler)
+            analysisReader = analysis
+            configs += OutputConfiguration(analysis.surface)
+        }
+        _state.update { it.copy(analysisAvailable = useAnalysis) }
 
         val cfa = ch.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: 0
         val coord = CaptureCoordinator(
@@ -377,7 +390,6 @@ class CameraController(
         )
         coordinator = coord
 
-        val configs = mutableListOf(OutputConfiguration(surface), OutputConfiguration(analysis.surface))
         if (needJpeg) {
             val r = ImageReader.newInstance(out.jpeg.width, out.jpeg.height, ImageFormat.JPEG, 6)
             r.setOnImageAvailableListener({ reader ->
@@ -409,20 +421,18 @@ class CameraController(
             }
 
             override fun onConfigureFailed(s: CameraCaptureSession) {
-                if (gen == sessionGen) message("Camera session configuration failed")
+                if (gen == sessionGen) {
+                    Log.w(TAG, "onConfigureFailed (analysis=$useAnalysis jpeg=$needJpeg raw=$needRaw)")
+                    fallbackSessionLocked()
+                }
             }
         }
         val config = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, configs, executor, callback)
 
         val supported = try { dev.isSessionConfigurationSupported(config) } catch (e: Exception) { true }
         if (!supported) {
-            if (needJpeg && needRaw) {
-                message("DNG + JPEG together isn't supported on this lens, switching to DNG only")
-                _state.update { it.copy(settings = it.settings.copy(format = CaptureFormat.DNG)) }
-                createSessionLocked()
-            } else {
-                message("This lens can't open the requested outputs")
-            }
+            Log.w(TAG, "session not supported (analysis=$useAnalysis jpeg=$needJpeg raw=$needRaw)")
+            fallbackSessionLocked()
             return
         }
         try {
@@ -430,6 +440,45 @@ class CameraController(
         } catch (e: Exception) {
             message("Could not start the camera session: ${e.message}")
         }
+    }
+
+    /**
+     * Steps down one level each time the lens refuses a stream combination:
+     * DNG+JPEG -> DNG only -> no analysis stream -> JPEG (with analysis again). Every step reduces
+     * the request, so the chain always ends.
+     */
+    private fun fallbackSessionLocked() {
+        val s = _state.value.settings
+        when {
+            s.needsJpeg() && s.needsRaw() -> {
+                message("DNG + JPEG together isn't supported on this lens, switching to DNG only")
+                _state.update { it.copy(settings = it.settings.copy(format = CaptureFormat.DNG)) }
+            }
+            useAnalysis -> {
+                useAnalysis = false
+                val fixed = if (s.exposureMode == ExposureMode.SHUTTER_PRIORITY || s.exposureMode == ExposureMode.ISO_PRIORITY)
+                    s.copy(exposureMode = ExposureMode.MANUAL) else s
+                _state.update { it.copy(settings = fixed) }
+                message("Live histogram, peaking, zebras and priority modes are off: this lens can't run them alongside the capture outputs")
+            }
+            s.needsRaw() -> {
+                useAnalysis = true
+                message("RAW can't be opened on this lens with these settings, switching to JPEG")
+                _state.update {
+                    it.copy(
+                        settings = it.settings.copy(
+                            format = CaptureFormat.JPEG,
+                            drive = if (it.settings.drive == DriveMode.LOW_LIGHT) DriveMode.SINGLE else it.settings.drive
+                        )
+                    )
+                }
+            }
+            else -> {
+                message("This lens can't open the requested outputs")
+                return
+            }
+        }
+        createSessionLocked()
     }
 
     private fun closeSessionLocked() {
