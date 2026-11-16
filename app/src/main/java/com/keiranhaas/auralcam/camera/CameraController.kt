@@ -28,6 +28,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import java.util.concurrent.Executor
 import kotlin.math.abs
+import java.util.Locale
+import kotlin.math.pow
+import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 
 /**
  * Owns the Camera2 device and session. All mutation runs on one camera thread; the public API is safe
@@ -76,6 +80,9 @@ class CameraController(
     private var lastLiveMs = 0L
     private var jobCounter = 0L
     private var pendingJobs = 0
+
+    /** Bumped to cancel a running self-timer countdown or intervalometer. */
+    private var timerToken = 0
 
     private fun post(block: () -> Unit) {
         handler.post(block)
@@ -194,14 +201,77 @@ class CameraController(
 
     // ---------------------------------------------------------------- capture
 
+    /**
+     * The public shutter. Honours the self-timer; pressing it again cancels a running countdown or
+     * intervalometer. Volume keys and remotes call this too.
+     */
     fun capture() = post {
-        val dev = device ?: return@post
-        val sess = session ?: return@post
-        val fac = factory ?: return@post
-        val caps = _state.value.active ?: return@post
-        val coord = coordinator ?: return@post
+        val st = _state.value
+        when {
+            st.intervalRunning -> stopIntervalLocked()
+            st.countdown > 0 -> cancelTimersLocked()
+            st.settings.timerSeconds > 0 && st.sessionReady -> startCountdownLocked(st.settings.timerSeconds)
+            else -> captureNowLocked()
+        }
+    }
+
+    /** Fires [settings.intervalCount] shots, one every [settings.intervalSeconds] seconds. */
+    fun startIntervalometer() = post {
+        val st = _state.value
+        if (!st.sessionReady || st.intervalRunning || st.countdown > 0) return@post
+        val s = st.settings
+        val token = ++timerToken
+        _state.update { it.copy(intervalRunning = true, intervalShot = 0) }
+
+        fun shoot(n: Int) {
+            if (token != timerToken) return
+            if (pendingJobs > 0) {                 // previous frame still being written
+                handler.postDelayed({ shoot(n) }, 300)
+                return
+            }
+            captureNowLocked()
+            _state.update { it.copy(intervalShot = n + 1) }
+            if (n + 1 >= s.intervalCount) {
+                stopIntervalLocked()
+            } else {
+                handler.postDelayed({ shoot(n + 1) }, s.intervalSeconds * 1000L)
+            }
+        }
+        shoot(0)
+    }
+
+    private fun startCountdownLocked(seconds: Int) {
+        val token = ++timerToken
+        fun tick(left: Int) {
+            if (token != timerToken) return
+            _state.update { it.copy(countdown = left) }
+            if (left <= 0) {
+                captureNowLocked()
+            } else {
+                handler.postDelayed({ tick(left - 1) }, 1000)
+            }
+        }
+        tick(seconds)
+    }
+
+    private fun stopIntervalLocked() {
+        timerToken++
+        _state.update { it.copy(intervalRunning = false) }
+    }
+
+    private fun cancelTimersLocked() {
+        timerToken++
+        _state.update { it.copy(countdown = 0, intervalRunning = false) }
+    }
+
+    private fun captureNowLocked() {
+        val dev = device ?: return
+        val sess = session ?: return
+        val fac = factory ?: return
+        val caps = _state.value.active ?: return
+        val coord = coordinator ?: return
         val s = _state.value.settings
-        if (pendingJobs > 0 && s.drive != DriveMode.SINGLE) return@post
+        if (pendingJobs > 0 && s.drive != DriveMode.SINGLE) return
 
         val orientation = (caps.sensorOrientation + deviceOrientationDeg + 360) % 360
         val base = saver.newBaseName()
@@ -209,7 +279,7 @@ class CameraController(
             when (s.drive) {
                 DriveMode.SINGLE -> {
                     val job = CaptureJob(++jobCounter, base, s.needsJpeg(), s.needsRaw(), orientation)
-                    val request = buildStill(dev, fac, s, job) ?: return@post
+                    val request = buildStill(dev, fac, s, job) ?: return
                     pendingJobs += 1
                     sess.capture(request, stillCallback, handler)
                 }
@@ -218,14 +288,24 @@ class CameraController(
                         CaptureJob(++jobCounter, "${base}_${"%02d".format(i)}", s.needsJpeg(), s.needsRaw(), orientation)
                     }
                     val requests = jobs.mapNotNull { buildStill(dev, fac, s, it) }
-                    if (requests.size != jobs.size) return@post
+                    if (requests.size != jobs.size) return
+                    pendingJobs += jobs.size
+                    sess.captureBurst(requests, stillCallback, handler)
+                }
+                DriveMode.BRACKET -> {
+                    val frames = bracketSettings(s, caps, _state.value.live)
+                    val jobs = frames.map { (label, frameSettings) ->
+                        CaptureJob(++jobCounter, "${base}_EV$label", s.needsJpeg(), s.needsRaw(), orientation) to frameSettings
+                    }
+                    val requests = jobs.mapNotNull { (job, frameSettings) -> buildStill(dev, fac, frameSettings, job) }
+                    if (requests.size != jobs.size) return
                     pendingJobs += jobs.size
                     sess.captureBurst(requests, stillCallback, handler)
                 }
                 DriveMode.LOW_LIGHT -> {
                     val newMerger = mergerFactory ?: run {
                         message("Low-light mode is not available yet")
-                        return@post
+                        return
                     }
                     // Every frame must share one exposure or the average would be wrong.
                     val live = _state.value.live
@@ -244,7 +324,7 @@ class CameraController(
                     val requests = jobs.mapNotNull { buildStill(dev, fac, fixed, it) }
                     if (requests.size != jobs.size) {
                         group.merger.abort()
-                        return@post
+                        return
                     }
                     pendingJobs += jobs.size
                     sess.captureBurst(requests, stillCallback, handler)
@@ -259,6 +339,25 @@ class CameraController(
             pendingJobs = 0
             publishBusy()
             message("Capture failed: ${e.message}")
+        }
+    }
+
+    /**
+     * One entry per bracket frame, centred on the current exposure. The shutter moves first; whatever
+     * the sensor's shutter range can't absorb goes into ISO. In AUTO the live metered values are the centre.
+     */
+    private fun bracketSettings(s: CameraSettings, caps: CameraCaps, live: LiveReadout): List<Pair<String, CameraSettings>> {
+        val auto = s.exposureMode == ExposureMode.AUTO
+        val baseIso = if (auto) live.iso ?: s.iso else s.iso
+        val baseNs = if (auto) live.exposureTimeNs ?: s.exposureTimeNs else s.exposureTimeNs
+        val n = s.bracketFrames
+        return (0 until n).map { i ->
+            val ev = (i - (n - 1) / 2f) * s.bracketStepEv
+            val wantNs = baseNs * 2.0.pow(ev.toDouble())
+            val ns = wantNs.roundToLong().coerceIn(caps.exposureMinNs, caps.exposureMaxNs)
+            val iso = (baseIso * (wantNs / ns)).roundToInt().coerceIn(caps.isoMin, caps.isoMax)
+            String.format(Locale.US, "%+.1f", ev) to
+                s.copy(exposureMode = ExposureMode.MANUAL, iso = iso, exposureTimeNs = ns)
         }
     }
 
@@ -505,7 +604,8 @@ class CameraController(
         previewSurface?.release()
         previewSurface = null
         pendingJobs = 0
-        _state.update { it.copy(sessionReady = false, busy = false) }
+        timerToken++
+        _state.update { it.copy(sessionReady = false, busy = false, countdown = 0, intervalRunning = false) }
     }
 
     private fun closeCameraLocked() {
