@@ -78,7 +78,13 @@ object CameraEnumerator {
                 maxAeRegions = ch.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0,
                 maxAfRegions = ch.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0,
                 exactKelvin = manualPost && ColorMath.solve(ch, 5500) != null,
-                physicalIds = ch.physicalCameraIds
+                physicalIds = ch.physicalCameraIds,
+                nrModes = ch.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)?.toSet().orEmpty(),
+                edgeModes = ch.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)?.toSet().orEmpty(),
+                hotPixelModes = ch.get(CameraCharacteristics.HOT_PIXEL_AVAILABLE_HOT_PIXEL_MODES)?.toSet().orEmpty(),
+                aberrationModes = ch.get(CameraCharacteristics.COLOR_CORRECTION_AVAILABLE_ABERRATION_MODES)?.toSet().orEmpty(),
+                distortionModes = ch.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES)?.toSet().orEmpty(),
+                toneModes = ch.get(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES)?.toSet().orEmpty()
             )
         }
         return result.sortedBy { it.equivFocalMm }
