@@ -146,6 +146,10 @@ fun SettingsPanel(
             HintText("Lower = more edges highlighted. Peaking runs at preview resolution, so it shows coarse focus.")
         }
 
+        BracketSection(state, controller)
+        TimerSection(state, controller, onClose)
+        AdvancedProcessingSection(state, controller)
+
         Section("REMOTES") {
             HintText(
                 "Shutter: volume up or down, camera key, Enter, Space, D-pad centre, and headset or Bluetooth media buttons. " +
