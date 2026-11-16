@@ -244,6 +244,9 @@ fun CameraScreen(controller: CameraController, analysis: AnalysisPipeline, displ
                         ui = ui.copy(grid = GridType.entries[(ui.grid.ordinal + 1) % GridType.entries.size])
                     }
                     Pill("LEVEL", ui.level) { ui = ui.copy(level = !ui.level) }
+                    Pill(if (s.timerSeconds == 0) "TIMER" else "TIMER ${s.timerSeconds}s", s.timerSeconds > 0) {
+                        controller.update { it.copy(timerSeconds = nextTimer(it.timerSeconds)) }
+                    }
                     Pill(ui.hist.label, ui.hist != HistMode.OFF) {
                         ui = ui.copy(hist = HistMode.entries[(ui.hist.ordinal + 1) % HistMode.entries.size])
                     }
@@ -494,7 +497,16 @@ private fun ParamControl(state: CameraState, tab: ParamTab, controller: CameraCo
                     s.zoomRatio, caps.zoomMin, caps.zoomMax, caps.zoomMax > caps.zoomMin, Modifier.weight(1f)
                 ) { v -> controller.update { it.copy(zoomRatio = v) } }
             }
-            HintText("Pinch on the preview also zooms.")
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf(0.5f, 0.6f, 1f, 2f, 3f, 5f, 10f, 20f)
+                    .filter { it >= caps.zoomMin - 0.001f && it <= caps.zoomMax + 0.001f }
+                    .forEach { z ->
+                        Pill(formatZoom(z), selected = kotlin.math.abs(s.zoomRatio - z) < 0.05f) {
+                            controller.update { it.copy(zoomRatio = z) }
+                        }
+                    }
+            }
+            HintText("Pinch on the preview also zooms. The phone may switch lenses as the ratio crosses a stop.")
         }
     }
 }
@@ -522,21 +534,37 @@ private fun ShutterRow(state: CameraState, controller: CameraController) {
             LastShotThumb(state.lastSavedUri)
         }
 
-        Box(
-            Modifier
-                .size(78.dp)
-                .alpha(if (state.sessionReady) 1f else 0.4f)
-                .clip(CircleShape)
-                .border(4.dp, Color.White, CircleShape)
-                .padding(7.dp)
-                .clip(CircleShape)
-                .background(if (state.busy) WarnRed else Color.White)
-                .clickable(enabled = state.sessionReady) { controller.capture() }
-        )
+        Box(contentAlignment = Alignment.Center) {
+            Box(
+                Modifier
+                    .size(78.dp)
+                    .alpha(if (state.sessionReady) 1f else 0.4f)
+                    .clip(CircleShape)
+                    .border(4.dp, Color.White, CircleShape)
+                    .padding(7.dp)
+                    .clip(CircleShape)
+                    .background(if (state.busy) WarnRed else Color.White)
+                    .clickable(enabled = state.sessionReady) { controller.capture() }
+            )
+            when {
+                state.countdown > 0 ->
+                    Text("${state.countdown}", color = Color.Black, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                state.intervalRunning ->
+                    Text("${state.intervalShot}/${s.intervalCount}", color = Color.Black, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            }
+        }
 
         Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
             Pill(driveLabel(s.drive, s.burstCount, s.lowLightFrames), selected = s.drive != DriveMode.SINGLE) {
-                controller.update { it.copy(drive = nextDrive(it.drive, caps?.raw == true && state.lowLightAvailable)) }
+                controller.update {
+                    it.copy(
+                        drive = nextDrive(
+                            it.drive,
+                            lowLightOk = caps?.raw == true && state.lowLightAvailable,
+                            bracketOk = caps?.manualSensor == true
+                        )
+                    )
+                }
             }
         }
     }
@@ -599,16 +627,29 @@ private fun nextFormat(cur: CaptureFormat, rawAvailable: Boolean): CaptureFormat
 private fun driveLabel(d: DriveMode, burst: Int, lowLight: Int) = when (d) {
     DriveMode.SINGLE -> "SINGLE"
     DriveMode.BURST -> "BURST ×$burst"
+    DriveMode.BRACKET -> "BRACKET"
     DriveMode.LOW_LIGHT -> "LOW-LIGHT ×$lowLight"
 }
 
-private fun nextDrive(cur: DriveMode, lowLightOk: Boolean): DriveMode {
-    val order = listOf(DriveMode.SINGLE, DriveMode.BURST, DriveMode.LOW_LIGHT)
+private fun nextDrive(cur: DriveMode, lowLightOk: Boolean, bracketOk: Boolean): DriveMode {
+    val order = listOf(DriveMode.SINGLE, DriveMode.BURST, DriveMode.BRACKET, DriveMode.LOW_LIGHT)
     var i = order.indexOf(cur)
     repeat(order.size) {
         i = (i + 1) % order.size
         val d = order[i]
-        if (d != DriveMode.LOW_LIGHT || lowLightOk) return d
+        val ok = when (d) {
+            DriveMode.LOW_LIGHT -> lowLightOk
+            DriveMode.BRACKET -> bracketOk
+            else -> true
+        }
+        if (ok) return d
     }
     return cur
+}
+
+private fun nextTimer(cur: Int) = when (cur) {
+    0 -> 2
+    2 -> 5
+    5 -> 10
+    else -> 0
 }
