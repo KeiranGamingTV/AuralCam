@@ -348,7 +348,12 @@ private fun ExposureModeRow(state: CameraState, controller: CameraController) {
             ExposureMode.SHUTTER_PRIORITY to "SHUTTER-P",
             ExposureMode.ISO_PRIORITY to "ISO-P"
         )) {
-            Pill(label, selected = state.settings.exposureMode == mode, enabled = mode == ExposureMode.AUTO || manual) {
+            val modeEnabled = when (mode) {
+                ExposureMode.AUTO -> true
+                ExposureMode.MANUAL -> manual
+                else -> manual && state.analysisAvailable   // priority modes need the analysis stream
+            }
+            Pill(label, selected = state.settings.exposureMode == mode, enabled = modeEnabled) {
                 controller.update { it.copy(exposureMode = mode) }
             }
         }
