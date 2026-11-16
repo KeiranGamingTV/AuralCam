@@ -45,6 +45,7 @@ class RequestFactory(
         applyFocus(b, s, displayRotationDeg)
         applyWhiteBalance(b, s)
         applyProcessing(b, s)
+        applyOverrides(b, s)
 
         if (still) {
             b.putIf(CaptureRequest.JPEG_QUALITY, s.jpegQuality.toByte())
@@ -113,6 +114,42 @@ class RequestFactory(
                 CaptureRequest.CONTROL_AWB_MODE,
                 if (preset in awbModes) preset else CameraMetadata.CONTROL_AWB_MODE_AUTO
             )
+        }
+    }
+
+    /** User overrides win over the profile defaults. Anything the lens doesn't list is ignored. */
+    private fun applyOverrides(b: CaptureRequest.Builder, s: CameraSettings) {
+        val o = s.overrides
+        o.noiseReduction?.takeIf { it in caps.nrModes }?.let { b.putIf(CaptureRequest.NOISE_REDUCTION_MODE, it) }
+        o.edge?.takeIf { it in caps.edgeModes }?.let { b.putIf(CaptureRequest.EDGE_MODE, it) }
+        o.hotPixel?.takeIf { it in caps.hotPixelModes }?.let { b.putIf(CaptureRequest.HOT_PIXEL_MODE, it) }
+        o.aberration?.takeIf { it in caps.aberrationModes }
+            ?.let { b.putIf(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, it) }
+        o.distortion?.takeIf { it in caps.distortionModes }
+            ?.let { b.putIf(CaptureRequest.DISTORTION_CORRECTION_MODE, it) }
+
+        when (o.tone) {
+            ToneChoice.DEFAULT -> Unit
+            ToneChoice.FAST ->
+                if (CameraMetadata.TONEMAP_MODE_FAST in toneModes)
+                    b.putIf(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_FAST)
+            ToneChoice.HIGH_QUALITY ->
+                if (CameraMetadata.TONEMAP_MODE_HIGH_QUALITY in toneModes)
+                    b.putIf(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_HIGH_QUALITY)
+            ToneChoice.SRGB, ToneChoice.REC709 ->
+                if (CameraMetadata.TONEMAP_MODE_PRESET_CURVE in toneModes) {
+                    b.putIf(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_PRESET_CURVE)
+                    b.putIf(
+                        CaptureRequest.TONEMAP_PRESET_CURVE,
+                        if (o.tone == ToneChoice.SRGB) CameraMetadata.TONEMAP_PRESET_CURVE_SRGB
+                        else CameraMetadata.TONEMAP_PRESET_CURVE_REC709
+                    )
+                }
+            ToneChoice.GAMMA ->
+                if (CameraMetadata.TONEMAP_MODE_GAMMA_VALUE in toneModes) {
+                    b.putIf(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_GAMMA_VALUE)
+                    b.putIf(CaptureRequest.TONEMAP_GAMMA, o.gamma)
+                }
         }
     }
 
