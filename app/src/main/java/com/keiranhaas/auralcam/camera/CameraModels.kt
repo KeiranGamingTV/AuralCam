@@ -103,6 +103,7 @@ data class CameraState(
     val sessionReady: Boolean = false,
     val busy: Boolean = false,
     val exposureAtLimit: Boolean = false,
+    val analysisAvailable: Boolean = true,
     val lowLightAvailable: Boolean = false,
     val lastSavedUri: Uri? = null,
     val shutterTick: Int = 0,
