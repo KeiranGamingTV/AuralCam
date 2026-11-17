@@ -28,7 +28,7 @@ struct AnalysisInput {
 };
 
 struct AnalysisOutput {
-    int32_t hist[1024];   // luma, R, G, B (256 each)
+    int32_t hist[9216];   // luma, R, G, B (256 each), then waveform 64x64, then vectorscope 64x64
     float stats[8];       // meterLuma, hi%, lo%, mean, peaking%
     uint8_t *overlay;     // RGBA_8888 premultiplied, upright; may be null
     int overlayStride;
