@@ -71,6 +71,9 @@ bool analyzeYuv(const AnalysisInput &in, AnalysisOutput &out) {
     int32_t *rHist = out.hist + 256;
     int32_t *gHist = out.hist + 512;
     int32_t *bHist = out.hist + 768;
+    int32_t *waveHist = out.hist + 1024;          // 64 columns x 64 luma levels
+    int32_t *vecHist = out.hist + 1024 + 4096;    // 64 (V) x 64 (U) chroma cells
+    const int waveScale = (64 << 16) / outW;
 
     const bool drawOverlay = out.overlay != nullptr && out.overlayWidth == outW && out.overlayHeight == outH;
     const uint32_t peakPx = premultiplyToRgba(in.peakColorArgb);
@@ -99,6 +102,7 @@ bool analyzeYuv(const AnalysisInput &in, AnalysisOutput &out) {
                 meterSum += c;
                 meterCnt++;
             }
+            waveHist[((ox * waveScale) >> 16) * 64 + (c >> 2)]++;
 
             // RGB histogram on every second pixel (one chroma sample per 2x2 block). BT.601 full range.
             if (((sx | sy) & 1) == 0) {
@@ -108,6 +112,7 @@ bool analyzeYuv(const AnalysisInput &in, AnalysisOutput &out) {
                 if (vi >= in.vCap) vi = in.vCap - 1;
                 const int d = in.u[ui] - 128;
                 const int e = in.v[vi] - 128;
+                vecHist[(in.v[vi] >> 2) * 64 + (in.u[ui] >> 2)]++;
                 rHist[clamp255(c + ((359 * e) >> 8))]++;
                 gHist[clamp255(c - ((88 * d + 183 * e) >> 8))]++;
                 bHist[clamp255(c + ((454 * d) >> 8))]++;
