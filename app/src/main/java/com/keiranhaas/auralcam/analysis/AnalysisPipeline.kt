@@ -8,6 +8,7 @@ import com.keiranhaas.auralcam.camera.NormPoint
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.math.ln
 
 data class AnalysisConfig(
     val peaking: Boolean = false,
@@ -38,9 +39,41 @@ data class AnalysisConfig(
 fun analysisRotation(sensorOrientation: Int, displayRotationDeg: Int): Int =
     ((sensorOrientation - displayRotationDeg) % 360 + 360) % 360
 
-class Histograms(val luma: IntArray, val red: IntArray, val green: IntArray, val blue: IntArray) {
+class Histograms(
+    val luma: IntArray,
+    val red: IntArray,
+    val green: IntArray,
+    val blue: IntArray,
+    /** 64 columns x 64 luma levels: index = column * 64 + level. */
+    val wave: IntArray = IntArray(0),
+    /** 64 x 64 chroma cells: index = v * 64 + u. */
+    val vec: IntArray = IntArray(0)
+) {
     /** Tallest bin across all channels, for scaling the plot. */
     val peak: Int = maxOf(luma.max(), red.max(), green.max(), blue.max()).coerceAtLeast(1)
+    val wavePeak: Int = (wave.maxOrNull() ?: 1).coerceAtLeast(1)
+    val vecPeak: Int = (vec.maxOrNull() ?: 1).coerceAtLeast(1)
+}
+
+/**
+ * Stops (positive = brighter) that would move the brightest 0.5% of pixels to about 94% of full scale.
+ * Based on the preview's luma histogram, so it is a guide, not a guarantee of RAW headroom.
+ */
+fun AnalysisResult.ettrStops(): Float? {
+    val lum = histograms.luma
+    val total = lum.sum()
+    if (total <= 0) return null
+    val limit = (total * 0.005).toLong()
+    var acc = 0L
+    var bin = 255
+    while (bin > 0) {
+        acc += lum[bin]
+        if (acc >= limit) break
+        bin--
+    }
+    val p = bin.coerceAtLeast(8) / 255f
+    val stops = 2.2f * ln(0.94f / p) / ln(2f)
+    return stops.coerceIn(-3f, 3f)
 }
 
 class AnalysisResult(
@@ -100,7 +133,7 @@ class AnalysisPipeline(
         meter[1] = cfg.meterTop
         meter[2] = cfg.meterRight
         meter[3] = cfg.meterBottom
-        val hist = IntArray(1024)
+        val hist = IntArray(9216)
 
         frameCounter++
         val ok = NativeBridge.analyzeYuv(
@@ -128,7 +161,8 @@ class AnalysisPipeline(
             _result.value = AnalysisResult(
                 histograms = Histograms(
                     hist.copyOfRange(0, 256), hist.copyOfRange(256, 512),
-                    hist.copyOfRange(512, 768), hist.copyOfRange(768, 1024)
+                    hist.copyOfRange(512, 768), hist.copyOfRange(768, 1024),
+                    hist.copyOfRange(1024, 5120), hist.copyOfRange(5120, 9216)
                 ),
                 meterLuma = stats[0],
                 highlightClipPct = stats[1],
