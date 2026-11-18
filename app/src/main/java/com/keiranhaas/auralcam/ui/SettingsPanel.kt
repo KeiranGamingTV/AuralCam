@@ -149,6 +149,8 @@ fun SettingsPanel(
         BracketSection(state, controller)
         TimerSection(state, controller, onClose)
         AdvancedProcessingSection(state, controller)
+        AnalysisToolsSection(ui, onUi)
+        PresetSection(controller)
 
         Section("REMOTES") {
             HintText(
