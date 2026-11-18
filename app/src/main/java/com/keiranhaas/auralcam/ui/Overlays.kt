@@ -48,6 +48,11 @@ import kotlin.math.asin
 import kotlin.math.atan2
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import kotlin.math.cos
+import kotlin.math.ln
+import kotlin.math.sin
 
 // ---------------------------------------------------------------- focus peaking + zebras
 
@@ -245,13 +250,18 @@ fun Reticles(focus: NormPoint?, exposure: NormPoint?, afState: Int?, modifier: M
     }
 }
 
-// ---------------------------------------------------------------- histogram
+// ---------------------------------------------------------------- histogram, waveform, vectorscope
 
 @Composable
 fun HistogramView(analysis: AnalysisPipeline, mode: HistMode, modifier: Modifier = Modifier) {
     if (mode == HistMode.OFF) return
     val result by analysis.result.collectAsStateWithLifecycle()
     val r = result
+    val plotHeight = when (mode) {
+        HistMode.VECTOR -> 110.dp
+        HistMode.WAVE -> 84.dp
+        else -> 56.dp
+    }
 
     Column(
         modifier
@@ -259,45 +269,140 @@ fun HistogramView(analysis: AnalysisPipeline, mode: HistMode, modifier: Modifier
             .background(Scrim)
             .padding(6.dp)
     ) {
-        Canvas(Modifier.size(width = 132.dp, height = 56.dp)) {
+        Canvas(Modifier.size(width = 132.dp, height = plotHeight)) {
             drawRect(Color(0x33FFFFFF), style = Stroke(1f))
             val hs = r?.histograms ?: return@Canvas
             val w = size.width
             val h = size.height
 
-            fun curve(bins: IntArray): Path {
-                val p = Path()
-                p.moveTo(0f, h)
-                for (i in 0..255) {
-                    val y = h - sqrt(bins[i].toFloat() / hs.peak) * h   // sqrt scale keeps small counts visible
-                    p.lineTo(i / 255f * w, y)
-                }
-                p.lineTo(w, h)
-                p.close()
-                return p
-            }
+            when (mode) {
+                HistMode.WAVE -> drawWaveform(hs.wave, hs.wavePeak)
+                HistMode.VECTOR -> drawVector(hs.vec, hs.vecPeak)
+                else -> {
+                    fun curve(bins: IntArray): Path {
+                        val p = Path()
+                        p.moveTo(0f, h)
+                        for (i in 0..255) {
+                            val y = h - sqrt(bins[i].toFloat() / hs.peak) * h   // sqrt scale keeps small counts visible
+                            p.lineTo(i / 255f * w, y)
+                        }
+                        p.lineTo(w, h)
+                        p.close()
+                        return p
+                    }
 
-            if (mode == HistMode.LUMA) {
-                drawPath(curve(hs.luma), Color.White.copy(alpha = 0.75f))
-            } else {
-                for ((bins, col) in listOf(
-                    hs.red to Color(0xFFFF4444),
-                    hs.green to Color(0xFF44FF66),
-                    hs.blue to Color(0xFF5588FF)
-                )) {
-                    val path = curve(bins)
-                    drawPath(path, col.copy(alpha = 0.30f))
-                    drawPath(path, col.copy(alpha = 0.90f), style = Stroke(1.dp.toPx()))
+                    if (mode == HistMode.LUMA) {
+                        drawPath(curve(hs.luma), Color.White.copy(alpha = 0.75f))
+                    } else {
+                        for ((bins, col) in listOf(
+                            hs.red to Color(0xFFFF4444),
+                            hs.green to Color(0xFF44FF66),
+                            hs.blue to Color(0xFF5588FF)
+                        )) {
+                            val path = curve(bins)
+                            drawPath(path, col.copy(alpha = 0.30f))
+                            drawPath(path, col.copy(alpha = 0.90f), style = Stroke(1.dp.toPx()))
+                        }
+                    }
+                    if (r.highlightClipPct > 0.5f) drawRect(WarnRed, Offset(w - 3.dp.toPx(), 0f), Size(3.dp.toPx(), h))
+                    if (r.shadowClipPct > 0.5f) drawRect(Color(0xFF5588FF), Offset(0f, 0f), Size(3.dp.toPx(), h))
                 }
             }
-            if (r.highlightClipPct > 0.5f) drawRect(WarnRed, Offset(w - 3.dp.toPx(), 0f), Size(3.dp.toPx(), h))
-            if (r.shadowClipPct > 0.5f) drawRect(Color(0xFF5588FF), Offset(0f, 0f), Size(3.dp.toPx(), h))
         }
-        Row(Modifier.width(132.dp)) {
-            val hi = r?.highlightClipPct ?: 0f
-            val lo = r?.shadowClipPct ?: 0f
-            Text("HI ${formatPct(hi)}", color = if (hi > 0.5f) WarnRed else Color(0xAAFFFFFF), fontSize = 10.sp, modifier = Modifier.weight(1f))
-            Text("LO ${formatPct(lo)}", color = if (lo > 0.5f) Color(0xFF5588FF) else Color(0xAAFFFFFF), fontSize = 10.sp)
+
+        if (mode == HistMode.LUMA || mode == HistMode.RGB) {
+            Row(Modifier.width(132.dp)) {
+                val hi = r?.highlightClipPct ?: 0f
+                val lo = r?.shadowClipPct ?: 0f
+                Text("HI ${formatPct(hi)}", color = if (hi > 0.5f) WarnRed else Color(0xAAFFFFFF), fontSize = 10.sp, modifier = Modifier.weight(1f))
+                Text("LO ${formatPct(lo)}", color = if (lo > 0.5f) Color(0xFF5588FF) else Color(0xAAFFFFFF), fontSize = 10.sp)
+            }
+        } else {
+            Text(
+                if (mode == HistMode.WAVE) "WAVEFORM  left→right of frame" else "VECTORSCOPE  orange = skin tone",
+                color = Color(0xAAFFFFFF), fontSize = 10.sp
+            )
         }
     }
+}
+
+/** Luma against horizontal position: bright areas climb the plot, so clipping shows as a flat line on top. */
+private fun DrawScope.drawWaveform(bins: IntArray, peak: Int) {
+    if (bins.size < 4096) return
+    val cw = size.width / 64f
+    val ch = size.height / 64f
+    for (col in 0 until 64) {
+        for (lvl in 0 until 64) {
+            val n = bins[col * 64 + lvl]
+            if (n == 0) continue
+            val a = sqrt(n.toFloat() / peak).coerceIn(0.12f, 1f)
+            drawRect(
+                Color(0xFF6CFFB0).copy(alpha = a),
+                topLeft = Offset(col * cw, (63 - lvl) * ch),
+                size = Size(cw + 0.5f, ch + 0.5f)
+            )
+        }
+    }
+    for (f in floatArrayOf(0.25f, 0.5f, 0.75f)) {
+        drawLine(Color(0x33FFFFFF), Offset(0f, size.height * f), Offset(size.width, size.height * f), 1f)
+    }
+}
+
+/** Chroma plot (U across, V up). A neutral scene piles up in the centre; the circle marks full saturation. */
+private fun DrawScope.drawVector(bins: IntArray, peak: Int) {
+    if (bins.size < 4096) return
+    val side = minOf(size.width, size.height)
+    val left = (size.width - side) / 2f
+    val cell = side / 64f
+    val logPeak = ln(1f + peak)
+    for (v in 0 until 64) {
+        for (u in 0 until 64) {
+            val n = bins[v * 64 + u]
+            if (n == 0) continue
+            val a = (ln(1f + n) / logPeak).coerceIn(0.15f, 1f)
+            val uu = u * 4 + 2 - 128f
+            val vv = v * 4 + 2 - 128f
+            val y = 150f
+            val rr = (y + 1.402f * vv).coerceIn(0f, 255f) / 255f
+            val gg = (y - 0.344f * uu - 0.714f * vv).coerceIn(0f, 255f) / 255f
+            val bb = (y + 1.772f * uu).coerceIn(0f, 255f) / 255f
+            drawRect(
+                Color(rr, gg, bb, a),
+                topLeft = Offset(left + u * cell, (63 - v) * cell),
+                size = Size(cell + 0.5f, cell + 0.5f)
+            )
+        }
+    }
+    val c = Offset(left + side / 2f, side / 2f)
+    val radius = side / 2f
+    val grid = Color(0x66FFFFFF)
+    drawCircle(grid, radius, c, style = Stroke(1f))
+    drawLine(grid, Offset(c.x - radius, c.y), Offset(c.x + radius, c.y), 1f)
+    drawLine(grid, Offset(c.x, c.y - radius), Offset(c.x, c.y + radius), 1f)
+    val skin = Math.toRadians(123.0)
+    drawLine(
+        Color(0xCCFF9800), c,
+        Offset(c.x + cos(skin).toFloat() * radius, c.y - sin(skin).toFloat() * radius), 1.5f
+    )
+}
+
+/** Small badge that appears when more than [thresholdPct] of the frame is blown out or crushed. */
+@Composable
+fun ClipBadge(analysis: AnalysisPipeline, thresholdPct: Float, modifier: Modifier = Modifier) {
+    if (thresholdPct <= 0f) return
+    val result by analysis.result.collectAsStateWithLifecycle()
+    val r = result ?: return
+    val hi = r.highlightClipPct
+    val lo = r.shadowClipPct
+    val highlights = hi >= thresholdPct
+    if (!highlights && lo < thresholdPct * 5f) return
+    Text(
+        text = if (highlights) "HIGHLIGHTS ${formatPct(hi)}" else "SHADOWS ${formatPct(lo)}",
+        color = Color.Black,
+        fontSize = 11.sp,
+        modifier = modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (highlights) WarnRed else Color(0xFF5588FF))
+            .padding(horizontal = 8.dp, vertical = 3.dp)
+    )
 }
