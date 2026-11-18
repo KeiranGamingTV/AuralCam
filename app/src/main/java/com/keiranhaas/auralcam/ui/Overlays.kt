@@ -129,14 +129,15 @@ class LevelReading(
 )
 
 @Composable
-fun rememberLevel(enabled: Boolean): State<LevelReading> {
+fun rememberLevel(enabled: Boolean, displayRotationDeg: Int = 0): State<LevelReading> {
     val context = LocalContext.current
     val state = remember { mutableStateOf(LevelReading()) }
+    val rotation = rememberUpdatedState(displayRotationDeg)
     DisposableEffect(enabled) {
         val sm = context.getSystemService(SensorManager::class.java)
         val sensor = sm?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         if (!enabled || sm == null || sensor == null) return@DisposableEffect onDispose { }
-        val f = FloatArray(3)
+        val f = FloatArray(3)   // low-pass filtered, in the phone's own axes
         var init = false
         val listener = object : SensorEventListener {
             override fun onSensorChanged(e: SensorEvent) {
@@ -146,16 +147,26 @@ fun rememberLevel(enabled: Boolean): State<LevelReading> {
                 } else {
                     for (i in 0..2) f[i] += 0.15f * (e.values[i] - f[i])
                 }
-                val g = sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2])
+                // Turn the phone's axes into screen axes for the current display rotation.
+                val sx: Float
+                val sy: Float
+                when (rotation.value) {
+                    90 -> { sx = -f[1]; sy = f[0] }
+                    180 -> { sx = -f[0]; sy = -f[1] }
+                    270 -> { sx = f[1]; sy = -f[0] }
+                    else -> { sx = f[0]; sy = f[1] }
+                }
+                val z = f[2]
+                val g = sqrt(sx * sx + sy * sy + z * z)
                 if (g < 1f) return
-                val roll = Math.toDegrees(atan2((-f[0]).toDouble(), f[1].toDouble())).toFloat()
-                val elev = -Math.toDegrees(asin((f[2] / g).coerceIn(-1f, 1f).toDouble())).toFloat()
+                val roll = Math.toDegrees(atan2((-sx).toDouble(), sy.toDouble())).toFloat()
+                val elev = -Math.toDegrees(asin((z / g).coerceIn(-1f, 1f).toDouble())).toFloat()
                 state.value = LevelReading(
                     rollDeg = roll,
                     elevationDeg = elev,
-                    flat = abs(f[2]) / g > 0.85f,
-                    bubbleX = (f[0] / g).coerceIn(-1f, 1f),
-                    bubbleY = (f[1] / g).coerceIn(-1f, 1f)
+                    flat = abs(z) / g > 0.85f,
+                    bubbleX = (sx / g).coerceIn(-1f, 1f),
+                    bubbleY = (sy / g).coerceIn(-1f, 1f)
                 )
             }
 
