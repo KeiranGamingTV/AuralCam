@@ -29,6 +29,8 @@ import com.keiranhaas.auralcam.camera.NormPoint
 import com.keiranhaas.auralcam.ui.AuralCamTheme
 import com.keiranhaas.auralcam.ui.CameraScreen
 import com.keiranhaas.auralcam.ui.PermissionScreen
+import android.content.res.Configuration
+import android.hardware.display.DisplayManager
 
 class MainActivity : ComponentActivity() {
 
@@ -38,6 +40,13 @@ class MainActivity : ComponentActivity() {
     private var mediaSession: MediaSession? = null
     private var permissionGranted by mutableStateOf(false)
     private var foreground = false
+    private var displayRotation by mutableStateOf(0)
+
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) = updateRotation()
+    }
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -68,11 +77,12 @@ class MainActivity : ComponentActivity() {
             PackageManager.PERMISSION_GRANTED
         if (!permissionGranted) permissionLauncher.launch(Manifest.permission.CAMERA)
 
-        val rotation = displayRotationDegrees()
+        displayRotation = displayRotationDegrees()
+
         setContent {
             AuralCamTheme {
                 if (permissionGranted) {
-                    CameraScreen(controller, analysis, rotation)
+                    CameraScreen(controller, analysis, displayRotation)
                 } else {
                     PermissionScreen(
                         onRequest = { permissionLauncher.launch(Manifest.permission.CAMERA) },
@@ -91,11 +101,14 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         foreground = true
+        getSystemService(DisplayManager::class.java).registerDisplayListener(displayListener, null)
+        updateRotation()
         if (permissionGranted) startCamera()
     }
 
     override fun onPause() {
-        foreground = false
+         foreground = false
+        getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayListener)
         controller.stop()
         orientationListener?.disable()
         mediaSession?.isActive = false
@@ -114,6 +127,20 @@ class MainActivity : ComponentActivity() {
         controller.start()
         orientationListener?.let { if (it.canDetectOrientation()) it.enable() }
         mediaSession?.isActive = true
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        updateRotation()
+    }
+
+    /** The display listener also catches 180° flips, which don't trigger onConfigurationChanged. */
+    private fun updateRotation() {
+        val r = displayRotationDegrees()
+        if (r != displayRotation) {
+            displayRotation = r
+            controller.setDisplayRotation(r)
+        }
     }
 
     private fun displayRotationDegrees(): Int = when (display?.rotation) {
