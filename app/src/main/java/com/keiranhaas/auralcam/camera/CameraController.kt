@@ -50,7 +50,10 @@ class CameraController(
     private val executor = Executor { handler.post(it) }
     private val saver = MediaSaver(context)
 
-    private val _state = MutableStateFlow(CameraState(lowLightAvailable = mergerFactory != null))
+    private val presets = PresetStore(context)
+    private val _state = MutableStateFlow(
+        CameraState(lowLightAvailable = mergerFactory != null, settings = presets.load(0) ?: CameraSettings())
+    )
     val state: StateFlow<CameraState> = _state.asStateFlow()
 
     /** Set by the analysis layer (NDK batch). */
@@ -107,7 +110,10 @@ class CameraController(
 
     fun stop() {
         started = false
-        post { closeCameraLocked() }
+        post {
+            presets.save(0, _state.value.settings)   // remembered for the next launch
+            closeCameraLocked()
+        }
     }
 
     fun release() {
@@ -197,6 +203,51 @@ class CameraController(
         if (sol.iso == s.iso && sol.exposureNs == s.exposureTimeNs) return@post
         _state.update { it.copy(settings = s.copy(iso = sol.iso, exposureTimeNs = sol.exposureNs)) }
         applyRepeatingLocked()
+    }
+
+    // ---------------------------------------------------------------- exposure helper + presets
+
+    /**
+     * Moves exposure by [stops] (positive = brighter). MANUAL changes the shutter, then ISO. Every other mode
+     * shifts the exposure-compensation target, which AUTO and both priority modes already honour.
+     */
+    fun adjustExposureStops(stops: Float) = post {
+        val st = _state.value
+        val caps = st.active ?: return@post
+        val s = st.settings
+        if (abs(stops) < 0.1f) {
+            message("Exposure already sits at the right edge")
+            return@post
+        }
+        if (s.exposureMode == ExposureMode.MANUAL) {
+            val wantNs = s.exposureTimeNs * 2.0.pow(stops.toDouble())
+            val ns = wantNs.roundToLong().coerceIn(caps.exposureMinNs, caps.exposureMaxNs)
+            val iso = (s.iso * (wantNs / ns)).roundToInt().coerceIn(caps.isoMin, caps.isoMax)
+            _state.update { it.copy(settings = s.copy(exposureTimeNs = ns, iso = iso)) }
+        } else {
+            if (caps.evStep <= 0f || caps.evMax <= caps.evMin) {
+                message("This lens has no exposure compensation")
+                return@post
+            }
+            val idx = (s.evIndex + (stops / caps.evStep).roundToInt()).coerceIn(caps.evMin, caps.evMax)
+            _state.update { it.copy(settings = s.copy(evIndex = idx)) }
+        }
+        applyRepeatingLocked()
+        message(String.format(Locale.US, "Exposure %+.1f EV", stops))
+    }
+
+    fun savePreset(slot: Int) = post {
+        presets.save(slot, _state.value.settings)
+        message("Preset $slot saved")
+    }
+
+    fun loadPreset(slot: Int) = post {
+        val p = presets.load(slot) ?: run {
+            message("Preset $slot is empty")
+            return@post
+        }
+        update { p }
+        message("Preset $slot loaded")
     }
 
     // ---------------------------------------------------------------- capture
