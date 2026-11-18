@@ -31,7 +31,7 @@ Java_com_keiranhaas_auralcam_NativeBridge_analyzeYuv(
         jintArray outHist,
         jfloatArray outStats) {
     if (!yBuf || !uBuf || !vBuf || !outHist || !outStats || !meterRect) return JNI_FALSE;
-    if (env->GetArrayLength(outHist) < 1024 || env->GetArrayLength(outStats) < 8 ||
+    if (env->GetArrayLength(outHist) < 9216 || env->GetArrayLength(outStats) < 8 ||
         env->GetArrayLength(meterRect) < 4) {
         return JNI_FALSE;
     }
@@ -89,7 +89,7 @@ Java_com_keiranhaas_auralcam_NativeBridge_analyzeYuv(
     if (locked) AndroidBitmap_unlockPixels(env, overlayBitmap);
     if (!ok) return JNI_FALSE;
 
-    env->SetIntArrayRegion(outHist, 0, 1024, reinterpret_cast<const jint *>(out.hist));
+    env->SetIntArrayRegion(outHist, 0, 9216, reinterpret_cast<const jint *>(out.hist));
     env->SetFloatArrayRegion(outStats, 0, 8, out.stats);
     return JNI_TRUE;
 }
