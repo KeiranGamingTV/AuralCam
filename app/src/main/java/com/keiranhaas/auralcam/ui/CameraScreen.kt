@@ -3,6 +3,8 @@ package com.keiranhaas.auralcam.ui
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.graphics.Matrix
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.net.Uri
 import android.view.TextureView
@@ -23,12 +25,15 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.displayCutoutPadding
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -46,9 +51,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -59,6 +67,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.keiranhaas.auralcam.analysis.AnalysisPipeline
 import com.keiranhaas.auralcam.analysis.analysisRotation
+import com.keiranhaas.auralcam.analysis.ettrStops
 import com.keiranhaas.auralcam.camera.CameraController
 import com.keiranhaas.auralcam.camera.CameraState
 import com.keiranhaas.auralcam.camera.CaptureFormat
@@ -82,9 +91,10 @@ fun CameraScreen(controller: CameraController, analysis: AnalysisPipeline, displ
     val state by controller.state.collectAsStateWithLifecycle()
     var ui by remember { mutableStateOf(UiOptions()) }
     var drag by remember { mutableStateOf<DragState?>(null) }
-    val level = rememberLevel(ui.level)
+    val level = rememberLevel(ui.level, displayRotationDeg)
     val s = state.settings
     val caps = state.active
+    val landscape = displayRotationDeg == 90 || displayRotationDeg == 270
 
     // Push overlay settings and the metered area into the native analysis.
     LaunchedEffect(ui.peaking, ui.zebra, ui.zebraLevel, ui.peakThreshold, s.aePoint, caps?.sensorOrientation, displayRotationDeg) {
@@ -113,196 +123,238 @@ fun CameraScreen(controller: CameraController, analysis: AnalysisPipeline, displ
     }
 
     val previewSize = state.previewSize
-    val aspect = if (previewSize != null) {
-        min(previewSize.width, previewSize.height).toFloat() / max(previewSize.width, previewSize.height).toFloat()
-    } else 0.75f
+    val bufferW = previewSize?.let { max(it.width, it.height) } ?: 0
+    val bufferH = previewSize?.let { min(it.width, it.height) } ?: 0
+    val ratio = if (bufferH > 0) bufferW.toFloat() / bufferH.toFloat() else 4f / 3f
+    val aspect = if (landscape) ratio else 1f / ratio
 
     val latestState by rememberUpdatedState(state)
     val latestTarget by rememberUpdatedState(ui.touchTarget)
+    val magOrigin = s.afPoint?.takeIf { s.focusMode == FocusMode.AUTO_TOUCH } ?: NormPoint(0.5f, 0.5f)
 
-    Box(Modifier.fillMaxSize().background(Color.Black)) {
-        Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
-
-            // ------------------------------------------------------------ preview
-            Box(Modifier.fillMaxWidth().aspectRatio(aspect)) {
-                CameraPreview(controller, Modifier.fillMaxSize())
-                PeakZebraOverlay(analysis, Modifier.fillMaxSize())
-                GridOverlay(ui.grid, Modifier.fillMaxSize())
-                if (ui.level) LevelOverlay(level, Modifier.fillMaxSize())
-
-                val d = drag
-                val focusPoint = if (d?.target == TouchTarget.FOCUS) d.point
-                else s.afPoint.takeIf { s.focusMode == FocusMode.AUTO_TOUCH }
-                val exposurePoint = if (d?.target == TouchTarget.EXPOSURE) d.point else s.aePoint
-                Reticles(focusPoint, exposurePoint, state.live.afState, Modifier.fillMaxSize())
-
-                // Touch layer: tap = place point, long-press = clear, drag a reticle = move it, pinch = zoom.
+    // ---------------------------------------------------------------- preview area
+    val previewBlock: @Composable (Modifier) -> Unit = { mod ->
+        Box(mod) {
+            // Everything that must magnify together (and keep touch coordinates honest) lives in this layer.
+            Box(Modifier.fillMaxSize().clipToBounds()) {
                 Box(
                     Modifier
                         .fillMaxSize()
-                        .pointerInput(Unit) {
-                            detectTapGestures(
-                                onTap = { off ->
-                                    val p = NormPoint(
-                                        (off.x / size.width).coerceIn(0f, 1f),
-                                        (off.y / size.height).coerceIn(0f, 1f)
-                                    )
-                                    when (latestTarget) {
-                                        TouchTarget.FOCUS -> controller.tapToFocus(p)
-                                        TouchTarget.EXPOSURE -> controller.setExposurePoint(p)
-                                        TouchTarget.BOTH -> {
-                                            controller.tapToFocus(p)
-                                            controller.setExposurePoint(p)
-                                        }
-                                    }
-                                },
-                                onLongPress = {
-                                    controller.clearFocusPoint()
-                                    controller.setExposurePoint(null)
-                                }
-                            )
-                        }
-                        .pointerInput(Unit) {
-                            var target: TouchTarget? = null
-                            detectDragGestures(
-                                onDragStart = { off ->
-                                    val st = latestState.settings
-                                    val w = size.width
-                                    val h = size.height
-                                    val threshold = 56.dp.toPx()
-                                    fun dist(p: NormPoint?) =
-                                        if (p == null) Float.MAX_VALUE else hypot(p.x * w - off.x, p.y * h - off.y)
-                                    val df = dist(st.afPoint.takeIf { st.focusMode == FocusMode.AUTO_TOUCH })
-                                    val da = dist(st.aePoint)
-                                    target = when {
-                                        df <= threshold && df <= da -> TouchTarget.FOCUS
-                                        da <= threshold -> TouchTarget.EXPOSURE
-                                        else -> null
-                                    }
-                                },
-                                onDrag = { change, _ ->
-                                    val t = target
-                                    if (t != null) {
-                                        val p = NormPoint(
-                                            (change.position.x / size.width).coerceIn(0f, 1f),
-                                            (change.position.y / size.height).coerceIn(0f, 1f)
-                                        )
-                                        drag = DragState(t, p)
-                                        if (t == TouchTarget.EXPOSURE) controller.setExposurePoint(p)
-                                    }
-                                },
-                                onDragEnd = {
-                                    val dd = drag
-                                    if (dd?.target == TouchTarget.FOCUS) controller.tapToFocus(dd.point)
-                                    drag = null
-                                    target = null
-                                },
-                                onDragCancel = {
-                                    drag = null
-                                    target = null
-                                }
-                            )
-                        }
-                        .pointerInput(Unit) {
-                            awaitEachGesture {
-                                awaitFirstDown(requireUnconsumed = false)
-                                var last = 0f
-                                do {
-                                    val event = awaitPointerEvent()
-                                    val pressed = event.changes.filter { it.pressed }
-                                    if (pressed.size >= 2) {
-                                        val dist = (pressed[0].position - pressed[1].position).getDistance()
-                                        if (last > 0f && dist > 0f) {
-                                            val factor = dist / last
-                                            controller.update { it.copy(zoomRatio = it.zoomRatio * factor) }
-                                        }
-                                        last = dist
-                                        event.changes.forEach { it.consume() }
-                                    } else {
-                                        last = 0f
-                                    }
-                                } while (event.changes.any { it.pressed })
+                        .graphicsLayer {
+                            if (ui.magnifier) {
+                                scaleX = ui.magnifyFactor
+                                scaleY = ui.magnifyFactor
+                                transformOrigin = TransformOrigin(magOrigin.x, magOrigin.y)
                             }
                         }
-                )
-
-                // Toolbar
-                Row(
-                    Modifier
-                        .align(Alignment.TopStart)
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState())
-                        .padding(8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Pill(formatLabel(s.format), selected = s.drive == DriveMode.LOW_LIGHT, enabled = s.drive != DriveMode.LOW_LIGHT) {
-                        controller.update { it.copy(format = nextFormat(it.format, caps?.raw == true)) }
-                    }
-                    Pill("PEAK", ui.peaking) { ui = ui.copy(peaking = !ui.peaking) }
-                    Pill("ZEBRA", ui.zebra) { ui = ui.copy(zebra = !ui.zebra) }
-                    Pill(ui.grid.label, ui.grid != GridType.OFF) {
-                        ui = ui.copy(grid = GridType.entries[(ui.grid.ordinal + 1) % GridType.entries.size])
-                    }
-                    Pill("LEVEL", ui.level) { ui = ui.copy(level = !ui.level) }
-                    Pill(if (s.timerSeconds == 0) "TIMER" else "TIMER ${s.timerSeconds}s", s.timerSeconds > 0) {
-                        controller.update { it.copy(timerSeconds = nextTimer(it.timerSeconds)) }
-                    }
-                    Pill(ui.hist.label, ui.hist != HistMode.OFF) {
-                        ui = ui.copy(hist = HistMode.entries[(ui.hist.ordinal + 1) % HistMode.entries.size])
-                    }
-                    Pill("SET") { ui = ui.copy(settingsOpen = true) }
-                }
+                    CameraPreview(controller, bufferW, bufferH, displayRotationDeg, Modifier.fillMaxSize())
+                    PeakZebraOverlay(analysis, Modifier.fillMaxSize())
 
-                // Live readout
-                Column(
-                    Modifier
-                        .align(Alignment.TopStart)
-                        .padding(start = 8.dp, top = 48.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Scrim)
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                ) {
-                    val iso = state.live.iso ?: s.iso
-                    val ns = state.live.exposureTimeNs ?: s.exposureTimeNs
-                    Text("ISO $iso   ${formatShutter(ns)}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                    Text(
-                        "${if (s.whiteBalance == WhiteBalanceMode.AUTO) "AWB" else "${s.kelvin}K"}   ${formatZoom(s.zoomRatio)}   " +
-                            driveLabel(s.drive, s.burstCount, s.lowLightFrames),
-                        color = Color(0xCCFFFFFF), fontSize = 11.sp
+                    val d = drag
+                    val focusPoint = if (d?.target == TouchTarget.FOCUS) d.point
+                    else s.afPoint.takeIf { s.focusMode == FocusMode.AUTO_TOUCH }
+                    val exposurePoint = if (d?.target == TouchTarget.EXPOSURE) d.point else s.aePoint
+                    Reticles(focusPoint, exposurePoint, state.live.afState, Modifier.fillMaxSize())
+
+                    // Touch layer: tap = place point, long-press = clear, drag a reticle = move it, pinch = zoom.
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .pointerInput(Unit) {
+                                detectTapGestures(
+                                    onTap = { off ->
+                                        val p = NormPoint(
+                                            (off.x / size.width).coerceIn(0f, 1f),
+                                            (off.y / size.height).coerceIn(0f, 1f)
+                                        )
+                                        when (latestTarget) {
+                                            TouchTarget.FOCUS -> controller.tapToFocus(p)
+                                            TouchTarget.EXPOSURE -> controller.setExposurePoint(p)
+                                            TouchTarget.BOTH -> {
+                                                controller.tapToFocus(p)
+                                                controller.setExposurePoint(p)
+                                            }
+                                        }
+                                    },
+                                    onLongPress = {
+                                        controller.clearFocusPoint()
+                                        controller.setExposurePoint(null)
+                                    }
+                                )
+                            }
+                            .pointerInput(Unit) {
+                                var target: TouchTarget? = null
+                                detectDragGestures(
+                                    onDragStart = { off ->
+                                        val st = latestState.settings
+                                        val w = size.width
+                                        val h = size.height
+                                        val threshold = 56.dp.toPx()
+                                        fun dist(p: NormPoint?) =
+                                            if (p == null) Float.MAX_VALUE else hypot(p.x * w - off.x, p.y * h - off.y)
+                                        val df = dist(st.afPoint.takeIf { st.focusMode == FocusMode.AUTO_TOUCH })
+                                        val da = dist(st.aePoint)
+                                        target = when {
+                                            df <= threshold && df <= da -> TouchTarget.FOCUS
+                                            da <= threshold -> TouchTarget.EXPOSURE
+                                            else -> null
+                                        }
+                                    },
+                                    onDrag = { change, _ ->
+                                        val t = target
+                                        if (t != null) {
+                                            val p = NormPoint(
+                                                (change.position.x / size.width).coerceIn(0f, 1f),
+                                                (change.position.y / size.height).coerceIn(0f, 1f)
+                                            )
+                                            drag = DragState(t, p)
+                                            if (t == TouchTarget.EXPOSURE) controller.setExposurePoint(p)
+                                        }
+                                    },
+                                    onDragEnd = {
+                                        val dd = drag
+                                        if (dd?.target == TouchTarget.FOCUS) controller.tapToFocus(dd.point)
+                                        drag = null
+                                        target = null
+                                    },
+                                    onDragCancel = {
+                                        drag = null
+                                        target = null
+                                    }
+                                )
+                            }
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    awaitFirstDown(requireUnconsumed = false)
+                                    var last = 0f
+                                    do {
+                                        val event = awaitPointerEvent()
+                                        val pressed = event.changes.filter { it.pressed }
+                                        if (pressed.size >= 2) {
+                                            val dist = (pressed[0].position - pressed[1].position).getDistance()
+                                            if (last > 0f && dist > 0f) {
+                                                val factor = dist / last
+                                                controller.update { it.copy(zoomRatio = it.zoomRatio * factor) }
+                                            }
+                                            last = dist
+                                            event.changes.forEach { it.consume() }
+                                        } else {
+                                            last = 0f
+                                        }
+                                    } while (event.changes.any { it.pressed })
+                                }
+                            }
                     )
-                    if (state.exposureAtLimit) Text("EXPOSURE LIMIT", color = Accent, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                 }
-
-                HistogramView(analysis, ui.hist, Modifier.align(Alignment.TopEnd).padding(end = 8.dp, top = 48.dp))
-
-                // Lens switcher
-                Row(
-                    Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    state.lenses.forEach { c ->
-                        Pill("${c.equivFocalMm.roundToInt()}mm", selected = caps?.id == c.id) { controller.selectLens(c.id) }
-                    }
-                }
-
-                if (flash.value > 0.01f) Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = flash.value)))
             }
 
-            // ------------------------------------------------------------ controls
-            Column(Modifier.weight(1f).fillMaxWidth()) {
-                Column(
-                    Modifier
-                        .weight(1f)
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    ExposureModeRow(state, controller)
-                    TouchRow(state, ui, { ui = it }, controller)
-                    ParamTabs(state, ui, { ui = it })
-                    ParamControl(state, ui.tab, controller)
+            // These stay put when the preview is magnified.
+            GridOverlay(ui.grid, Modifier.fillMaxSize())
+            if (ui.level) LevelOverlay(level, Modifier.fillMaxSize())
+
+            // Toolbar
+            Row(
+                Modifier
+                    .align(Alignment.TopStart)
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Pill(formatLabel(s.format), selected = s.drive == DriveMode.LOW_LIGHT, enabled = s.drive != DriveMode.LOW_LIGHT) {
+                    controller.update { it.copy(format = nextFormat(it.format, caps?.raw == true)) }
                 }
-                ShutterRow(state, controller)
+                Pill("PEAK", ui.peaking) { ui = ui.copy(peaking = !ui.peaking) }
+                Pill("ZEBRA", ui.zebra) { ui = ui.copy(zebra = !ui.zebra) }
+                Pill(if (ui.magnifier) "MAG ${ui.magnifyFactor.roundToInt()}×" else "MAG", ui.magnifier) {
+                    ui = ui.copy(magnifier = !ui.magnifier)
+                }
+                Pill(ui.grid.label, ui.grid != GridType.OFF) {
+                    ui = ui.copy(grid = GridType.entries[(ui.grid.ordinal + 1) % GridType.entries.size])
+                }
+                Pill("LEVEL", ui.level) { ui = ui.copy(level = !ui.level) }
+                Pill(if (s.timerSeconds == 0) "TIMER" else "TIMER ${s.timerSeconds}s", s.timerSeconds > 0) {
+                    controller.update { it.copy(timerSeconds = nextTimer(it.timerSeconds)) }
+                }
+                Pill("ETTR", enabled = state.analysisAvailable) {
+                    val stops = analysis.result.value?.ettrStops()
+                    if (stops != null) controller.adjustExposureStops(stops)
+                }
+                Pill(ui.hist.label, ui.hist != HistMode.OFF) {
+                    ui = ui.copy(hist = HistMode.entries[(ui.hist.ordinal + 1) % HistMode.entries.size])
+                }
+                Pill("SET") { ui = ui.copy(settingsOpen = true) }
+            }
+
+            // Live readout
+            Column(
+                Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 8.dp, top = 48.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Scrim)
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                val iso = state.live.iso ?: s.iso
+                val ns = state.live.exposureTimeNs ?: s.exposureTimeNs
+                Text("ISO $iso   ${formatShutter(ns)}", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Text(
+                    "${if (s.whiteBalance == WhiteBalanceMode.AUTO) "AWB" else "${s.kelvin}K"}   ${formatZoom(s.zoomRatio)}   " +
+                        driveLabel(s.drive, s.burstCount, s.lowLightFrames),
+                    color = Color(0xCCFFFFFF), fontSize = 11.sp
+                )
+                if (state.exposureAtLimit) Text("EXPOSURE LIMIT", color = Accent, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                ClipBadge(analysis, ui.clipAlertPct, Modifier.padding(top = 3.dp))
+            }
+
+            HistogramView(analysis, ui.hist, Modifier.align(Alignment.TopEnd).padding(end = 8.dp, top = 48.dp))
+
+            // Lens switcher
+            Row(
+                Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                state.lenses.forEach { c ->
+                    Pill("${c.equivFocalMm.roundToInt()}mm", selected = caps?.id == c.id) { controller.selectLens(c.id) }
+                }
+            }
+
+            if (flash.value > 0.01f) Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = flash.value)))
+        }
+    }
+
+    // ---------------------------------------------------------------- controls area
+    val controlsBlock: @Composable (Modifier) -> Unit = { mod ->
+        Column(mod) {
+            Column(
+                Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                ExposureModeRow(state, controller)
+                TouchRow(state, ui, { ui = it }, controller)
+                ParamTabs(state, ui, { ui = it })
+                ParamControl(state, ui.tab, controller)
+            }
+            ShutterRow(state, controller)
+        }
+    }
+
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        if (landscape) {
+            Row(Modifier.fillMaxSize().displayCutoutPadding().statusBarsPadding().navigationBarsPadding()) {
+                Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
+                    previewBlock(Modifier.aspectRatio(aspect))
+                }
+                controlsBlock(Modifier.width(340.dp).fillMaxHeight())
+            }
+        } else {
+            Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
+                previewBlock(Modifier.fillMaxWidth().aspectRatio(aspect))
+                controlsBlock(Modifier.weight(1f).fillMaxWidth())
             }
         }
 
@@ -314,8 +366,52 @@ fun CameraScreen(controller: CameraController, analysis: AnalysisPipeline, displ
 
 // ---------------------------------------------------------------- preview surface
 
+private class PreviewParams {
+    var bufferW = 0
+    var bufferH = 0
+    var rotation = 0
+}
+
+/**
+ * The camera delivers sensor-landscape buffers. In portrait and the 180° case the system compensates;
+ * in landscape the TextureView needs this rotate-and-scale matrix (the standard Camera2 sample transform).
+ */
+private fun applyPreviewTransform(view: TextureView, p: PreviewParams) {
+    val vw = view.width.toFloat()
+    val vh = view.height.toFloat()
+    if (vw <= 0f || vh <= 0f || p.bufferW <= 0 || p.bufferH <= 0) return
+    val matrix = Matrix()
+    val cx = vw / 2f
+    val cy = vh / 2f
+    when (p.rotation) {
+        90, 270 -> {
+            val viewRect = RectF(0f, 0f, vw, vh)
+            val bufferRect = RectF(0f, 0f, p.bufferH.toFloat(), p.bufferW.toFloat())
+            bufferRect.offset(cx - bufferRect.centerX(), cy - bufferRect.centerY())
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+            val scale = max(vh / p.bufferH, vw / p.bufferW)
+            matrix.postScale(scale, scale, cx, cy)
+            matrix.postRotate(if (p.rotation == 90) -90f else 90f, cx, cy)
+        }
+        180 -> matrix.postRotate(180f, cx, cy)
+        else -> Unit
+    }
+    view.setTransform(matrix)
+}
+
 @Composable
-private fun CameraPreview(controller: CameraController, modifier: Modifier = Modifier) {
+private fun CameraPreview(
+    controller: CameraController,
+    bufferWidth: Int,
+    bufferHeight: Int,
+    rotationDeg: Int,
+    modifier: Modifier = Modifier
+) {
+    val params = remember { PreviewParams() }
+    params.bufferW = bufferWidth
+    params.bufferH = bufferHeight
+    params.rotation = rotationDeg
+
     AndroidView(
         modifier = modifier,
         factory = { ctx ->
@@ -334,8 +430,10 @@ private fun CameraPreview(controller: CameraController, modifier: Modifier = Mod
 
                     override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
                 }
+                addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ -> applyPreviewTransform(v as TextureView, params) }
             }
-        }
+        },
+        update = { view -> applyPreviewTransform(view, params) }
     )
 }
 
@@ -474,7 +572,7 @@ private fun ParamControl(state: CameraState, tab: ParamTab, controller: CameraCo
                     d, 0f, caps.minFocusDiopters, s.focusMode == FocusMode.MANUAL, Modifier.weight(1f)
                 ) { v -> controller.update { it.copy(focusDiopters = v) } }
             }
-            HintText("Left is infinity, right is the closest focus.")
+            HintText("Left is infinity, right is the closest focus. Use MAG in the toolbar to judge focus.")
         }
 
         ParamTab.EV -> {
@@ -486,8 +584,8 @@ private fun ParamControl(state: CameraState, tab: ParamTab, controller: CameraCo
                 ) { v -> controller.update { it.copy(evIndex = v.roundToInt()) } }
             }
             HintText(
-                if (m == ExposureMode.MANUAL) "Exposure compensation doesn't apply in manual mode."
-                else "Shifts the exposure target in AUTO and in both priority modes."
+                if (m == ExposureMode.MANUAL) "Exposure compensation doesn't apply in manual mode. ETTR in the toolbar adjusts the shutter instead."
+                else "Shifts the exposure target in AUTO and in both priority modes. ETTR in the toolbar sets it for you."
             )
         }
 
