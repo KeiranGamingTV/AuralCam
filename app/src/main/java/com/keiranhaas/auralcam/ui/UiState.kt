@@ -4,7 +4,9 @@ enum class GridType(val label: String) {
     OFF("GRID"), THIRDS("3×3"), GOLDEN("PHI"), TRIANGLE_A("TRI A"), TRIANGLE_B("TRI B")
 }
 
-enum class HistMode(val label: String) { OFF("HIST"), LUMA("LUMA"), RGB("RGB") }
+enum class HistMode(val label: String) {
+    OFF("HIST"), LUMA("LUMA"), RGB("RGB"), WAVE("WAVE"), VECTOR("VECTOR")
+}
 
 enum class TouchTarget(val label: String) { FOCUS("AF"), EXPOSURE("AE"), BOTH("AF+AE") }
 
@@ -25,5 +27,10 @@ data class UiOptions(
     /** Luma (0..255) at or above which zebra stripes appear. */
     val zebraLevel: Int = 245,
     /** Peaking edge threshold; lower = more sensitive. */
-    val peakThreshold: Int = 50
+    val peakThreshold: Int = 50,
+    /** Focus magnifier on/off and its zoom factor. */
+    val magnifier: Boolean = false,
+    val magnifyFactor: Float = 4f,
+    /** Percent of the frame clipped before the warning badge appears; 0 = off. */
+    val clipAlertPct: Float = 1f
 )
